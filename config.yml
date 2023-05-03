@@ -1,0 +1,828 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@5.0.3
+  releaser: silvercar/releaser@1.7.0
+  synthetics-ci: datadog/synthetics-ci-orb@1.0.1
+  slack: circleci/slack@4.12.1
+
+parameters:
+  angular_app_env:
+    type: string
+    default: feature
+  angular_github_tag:
+    type: string
+    default: ""
+  angular_aws_account:
+    type: string
+    default: SILVERCAR
+  enable_dw_web_workflow:
+    type: boolean
+    default: true
+  enable_mob_dealerware_web_workflow:
+    type: boolean
+    default: false
+
+commands:
+  validate_tag:
+    parameters:
+      TAG:
+        type: string
+      WORKING_DIRECTORY:
+        type: string
+        default: "~/project"
+    steps:
+      - run:
+          name: Validate Tag
+          working_directory: << parameters.WORKING_DIRECTORY >>
+          command: |
+            .circleci/validate_tag.sh << parameters.TAG >>
+  notify:
+    parameters:
+      APP_NAME:
+        type: string
+        default: "DW Web"
+      VERSION:
+        type: string
+    steps:
+      - run:
+          name: Send notification
+          command: |
+            echo 'export PATH="$PATH:~/.local/bin"' >> $BASH_ENV
+            source $BASH_ENV
+            python3 .circleci/slack-notify.py -n "<< parameters.APP_NAME >>" -v "<< parameters.VERSION >>" -u "${SLACK_WEBHOOK_URL}"
+  init_ssh:
+    steps:
+      - run:
+          name: SSH Setup
+          command: |
+            .circleci/init_ssh_ci.sh
+  install_manage_buckets:
+    steps:
+      - run:
+          name: Install Manage Buckets & Dependencies
+          command: |
+            .circleci/init_manage_buckets.sh
+  feature_cleanup:
+    parameters:
+      PREFIX:
+        type: string
+        default: "dw-web-"
+      TLD:
+        type: string
+        default: "dw-tst.com"
+      WORKING_DIRECTORY:
+        type: string
+        default: "~/project"
+    steps:
+      - install_manage_buckets
+      - run:
+          name: Make cleanup.sh globally executable
+          command: |
+            cp .circleci/cleanup.sh /usr/local/bin/cleanup.sh
+      - run:
+          name: Cleanup Old Feature Branches
+          working_directory: << parameters.WORKING_DIRECTORY >>
+          command: |
+            cleanup.sh "<< parameters.PREFIX >>" "<< parameters.TLD >>"
+
+  clone_angular:
+    parameters:
+      GIT_TAG:
+        type: string
+        default: ""
+      GIT_BRANCH:
+        type: string
+        default: "master"
+    steps:
+      - run:
+          name: Clone mob-dealerware-web
+          command: |
+            if [ -n "<< parameters.GIT_TAG >>" ]; then
+              echo "Tag is not empty.  Checking out tag: << parameters.GIT_TAG >>"
+              git clone --single-branch --branch << parameters.GIT_TAG >> git@github.com:silvercar/mob-dealerware-web.git
+            else
+              echo "Tag is empty.  Checking out branch: << parameters.GIT_BRANCH >>"
+              .circleci/checkout_or_create.sh "<< parameters.GIT_BRANCH >>" git@github.com:silvercar/mob-dealerware-web.git
+            fi
+  install_deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "package-lock.json" }}
+      - run: npm ci
+      - save_cache:
+          key: v1-deps-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules
+
+jobs:
+  #############
+  # DW Web Jobs
+  #############
+
+  lint:
+    working_directory: ~/project
+    docker:
+      - image: cimg/node:16.17.0
+    steps:
+      - checkout
+      - install_deps
+      - run:
+          name: Run Linter
+          command: npm run lint:ci
+
+  test:
+    working_directory: ~/project
+    docker:
+      - image: cimg/node:16.17.0
+    steps:
+      - checkout
+      - install_deps
+      - run:
+          name: Run Tests
+          # Jest thinks it has access to all the host's CPU cores, this bogs down the container and crashes the process.
+          # We need to tell jest to spawn a reasonable amount of workers for our container resource class.
+          command: npm run test:ci
+
+  build:
+    working_directory: ~/project
+    parameters:
+      APP_ENV:
+        type: string
+        default: "feature"
+    docker:
+      - image: cimg/python:3.9.14-node
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - when:
+          condition:
+            equal: ["prd", << parameters.APP_ENV >>]
+          steps:
+            - validate_tag:
+                TAG: ${CIRCLE_TAG}
+      - run:
+          name: Load Environment Variables
+          command: |
+            # Exports all lines in the matched .env file that do not begin with '#'
+            grep -v '^#' environment/.env.<< parameters.APP_ENV >> | awk '{print "export " $0}' >> $BASH_ENV
+      - when:
+          condition:
+            equal: ["feature", << parameters.APP_ENV >>]
+          steps:
+            - run:
+                name: Check ANGULAR_BRANCH_NAME value is valid
+                command: |
+                  if [[ "${ANGULAR_BRANCH_NAME}" == "" ]]; then
+                    echo "No value found for ANGULAR_BRANCH_NAME, defaulting to dw-web feature branch name (${CIRCLE_BRANCH})"
+                    echo "export ANGULAR_BRANCH_NAME=${CIRCLE_BRANCH}" >> $BASH_ENV
+                  elif [[ "${ANGULAR_BRANCH_NAME}" == "master" ]]; then
+                    echo "ANGULAR_BRANCH_NAME must be set to a value other than 'master'.  Please update the value and try again.  See README for more details."
+                    exit 1
+                  fi
+            - clone_angular:
+                GIT_BRANCH: ${ANGULAR_BRANCH_NAME}
+            - run:
+                name: Gather Angular Web Feature Environment Variables
+                command: |
+                  PREFIX='dw-legacy-web-'
+                  SUFFIX='dw-tst.com'
+                  DW_HOST=https://$(./.circleci/bucket_name.sh ${ANGULAR_BRANCH_NAME} ${PREFIX} ${SUFFIX})
+                  echo "" >> "environment/.env.<< parameters.APP_ENV >>" # Ensures a newline is added before joining .env files
+                  echo "DW_HOST=${DW_HOST}" >> "environment/.env.<< parameters.APP_ENV >>"
+      - run:
+          name: Install tools
+          command: pip3 install --upgrade awscli
+      - install_deps
+      - run:
+          name: Building
+          command: |
+            if [[ "<< parameters.APP_ENV >>" == "prd" ]]; then
+              export NODE_ENV=production
+            elif [[ "<< parameters.APP_ENV >>" == "stg" ]]; then
+              export NODE_ENV=production
+            elif [[ "<< parameters.APP_ENV >>" == "sandbox" ]]; then
+              export NODE_ENV=production
+            else
+              export NODE_ENV=development
+            fi
+            echo "" >> "environment/.env.<< parameters.APP_ENV >>" # Ensures a newline is added before joining .env files
+            cat environment/.env.common >> "environment/.env.<< parameters.APP_ENV >>"
+            cp "environment/.env.<< parameters.APP_ENV >>" "environment/.env.${NODE_ENV}"
+
+            npm run build
+            cp robots.txt dist
+      - persist_to_workspace:
+          root: .
+          paths: dist
+
+  publish:
+    parameters:
+      aws_account:
+        type: string
+        default: "SILVERCAR"
+      APP_ENV:
+        type: string
+        default: "feature"
+    docker:
+      - image: python:3
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - add_ssh_keys:
+          fingerprints:
+            - "fe:98:0d:e6:8c:eb:63:62:fe:dc:60:e1:31:12:85:fa"
+      - checkout
+      - run:
+          name: Exporting AWS ENV variables
+          command: |
+            echo "export AWS_ACCESS_KEY_ID=$(echo $<< parameters.aws_account >>_AWS_ACCESS_KEY_ID)" >> $BASH_ENV
+            echo "export AWS_SECRET_ACCESS_KEY=$(echo $<< parameters.aws_account >>_AWS_SECRET_ACCESS_KEY)" >> $BASH_ENV
+      - run:
+          name: Load Environment Variables
+          command: |
+            # Exports all lines in the matched .env file that do not begin with '#'
+            grep -v '^#' environment/.env.<< parameters.APP_ENV >> | awk '{print "export " $0}' >> $BASH_ENV
+      - install_manage_buckets
+      - run:
+          name: Delete sourcemaps from dist
+          command: |
+            shopt -s globstar # This shell option enables recursive pattern matching for the .map files below
+            rm -f dist/**/*.map
+      - deploy:
+          name: Deploying to S3/Cloudfront
+          command: |
+            .circleci/deploy.sh $APP_ENV /tmp/workspace/dist $CIRCLE_BRANCH
+      - when:
+          condition:
+            equal: ["prd", << parameters.APP_ENV >>]
+          steps:
+            - notify:
+                VERSION: ${CIRCLE_TAG}
+
+  release-notification:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - releaser/create_existing_tag_release_info
+      - releaser/github_diff_link
+      - releaser/contributors
+      - releaser/jira_tickets
+      - releaser/notification:
+          slack_channel: release-coordination
+          version: $CIRCLE_TAG
+
+  build-storybook:
+    working_directory: ~/project
+    docker:
+      - image: cimg/node:16.17.0
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - checkout
+      - install_deps
+      - run:
+          name: Building
+          command: npm run build-storybook
+      - persist_to_workspace:
+          root: .
+          paths: dist_storybook
+
+  publish-storybook:
+    parameters:
+      aws_account:
+        type: string
+        default: "SILVERCAR"
+      APP_ENV:
+        type: string
+        default: "feature"
+    docker:
+      - image: python:3
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - checkout
+      - run:
+          name: Exporting AWS ENV variables
+          command: |
+            echo "export AWS_ACCESS_KEY_ID=$(echo $<< parameters.aws_account >>_AWS_ACCESS_KEY_ID)" >> $BASH_ENV
+            echo "export AWS_SECRET_ACCESS_KEY=$(echo $<< parameters.aws_account >>_AWS_SECRET_ACCESS_KEY)" >> $BASH_ENV
+      - run:
+          name: Load Environment Variables
+          command: |
+            # Exports all lines in the matched .env file that do not begin with '#'
+            grep -v '^#' environment/.env.<< parameters.APP_ENV >> | awk '{print "export " $0}' >> $BASH_ENV
+      - install_manage_buckets
+      - deploy:
+          name: Deploying to S3/Cloudfront
+          command: |
+            .circleci/deploy-storybook.sh $APP_ENV /tmp/workspace/dist_storybook $CIRCLE_BRANCH
+
+  upload-sourcemaps:
+    working_directory: ~/project
+    environment:
+      - NPM_CONFIG_PREFIX=~/.npm-global
+    parameters:
+      APP_ENV:
+        type: string
+        default: "qa"
+    docker:
+      - image: cimg/node:16.17.0
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: Load Environment Variables
+          command: |
+            # Exports BUGSNAG_API_KEY into the environment from .env.common
+            grep -v '^#' environment/.env.common | awk '{print "export " $0}' >> $BASH_ENV
+      - run:
+          name: Install Dependencies
+          command: npm install bugsnag-sourcemaps -g
+      - run:
+          name: Update PATH to include global npm bin
+          command: |
+            echo 'export PATH=~/.npm-global/bin:"$PATH"' >> "$BASH_ENV"
+            source "$BASH_ENV"
+      - run:
+          name: Upload Bugsnag Sourcemaps
+          command: |
+            bugsnag-sourcemaps upload --api-key $BUGSNAG_API_KEY \
+            --app-version $CIRCLE_TAG \
+            --directory \
+            --overwrite
+
+  post-release-synthetic-tests:
+    working_directory: ~/project
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - synthetics-ci/run-tests:
+          public_ids: 'auu-6nc-pab'
+      - slack/notify:
+          channel: CQVHA2ES0
+          event: fail
+          template: basic_fail_1
+          # it's going to send a notification to release-coordination channel in the event of a failure
+
+  dw_web_cleanup:
+    docker:
+      - image: python:3
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - checkout
+      - feature_cleanup:
+          PREFIX: "dw-web-"
+
+  danger:
+    docker:
+      - image: silvercar/danger
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - checkout
+      - run:
+          name: Run Danger Checks
+          command: |
+            danger --verbose
+
+  #########################
+  # Mob Dealerware Web Jobs
+  #########################
+  build-angular:
+    parameters:
+      APP_ENV:
+        type: string
+        default: << pipeline.parameters.angular_app_env >>
+      EMBEDDED_MODE:
+        type: boolean
+        default: true
+    working_directory: ~/project
+    docker:
+      # This project cannot be updated beyond node:10 without significant refactoring
+      - image: circleci/node:10-buster
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+        user: root
+    steps:
+      - checkout
+      - init_ssh
+      - when:
+          condition:
+            equal: ["feature", << parameters.APP_ENV >>]
+          steps:
+            - run:
+                name: Set Feature Branch Environment Variables
+                command: |
+                  # Setup default branch
+                  echo "export ANGULAR_BRANCH_NAME=${CIRCLE_BRANCH}" >> $BASH_ENV
+                  # Exports 'ANGULAR_BRANCH_NAME' from '.env.feature' into the environment
+                  grep -v '^#' environment/.env.feature | awk '{print "export " $0}' >> $BASH_ENV
+      - when:
+          # This branch handles setting ANGULAR_BRANCH_NAME for TST and STG deployments
+          condition:
+            and:
+              - not:
+                  equal: ["feature", << parameters.APP_ENV >>]
+              - equal: ["", << pipeline.parameters.angular_github_tag >>]
+          steps:
+            - run:
+                name: Set Angular Branch name
+                command: |
+                  # TST and STG deployments point to mob-dealerware-web's 'master' branch
+                  echo "export ANGULAR_BRANCH_NAME=master" >> $BASH_ENV
+      - clone_angular:
+          GIT_BRANCH: ${ANGULAR_BRANCH_NAME}
+          GIT_TAG: << pipeline.parameters.angular_github_tag >>
+      - when:
+          condition:
+            equal: ["production", << parameters.APP_ENV >>]
+          steps:
+            - validate_tag:
+                TAG: << pipeline.parameters.angular_github_tag >>
+                WORKING_DIRECTORY: "~/project/mob-dealerware-web"
+      - run:
+          name: Install packages
+          working_directory: ~/project/mob-dealerware-web
+          command: |
+            echo "Installing bower and gulp..."
+            npm install -g bower gulp
+
+            echo "Running bower install..."
+            bower install --allow-root
+
+            echo "Running npm install..."
+            npm install node-sass
+            npm install
+      - when:
+          # This step generates the feature-branch deployment configuration for mob-dealerware-web
+          condition:
+            equal: ["feature", << parameters.APP_ENV >>]
+          steps:
+            - run:
+                name: Gather DW Web Feature Environment Variables
+                command: |
+                  # Set MFE_ORIGIN to output from DW-WEB's bucket-name script
+                  PREFIX='dw-web-'
+                  SUFFIX='dw-tst.com'
+                  echo "export MFE_ORIGIN=https://$(./.circleci/bucket_name.sh ${CIRCLE_BRANCH} ${PREFIX} ${SUFFIX})" >> $BASH_ENV
+            - run:
+                name: Template Angular Config
+                working_directory: ~/project/mob-dealerware-web
+                command: |
+                  set -x
+                  .circleci/template.sh ${MFE_ORIGIN} ${API_HOST}
+      - run:
+          name: Build
+          working_directory: ~/project/mob-dealerware-web
+          command: |
+            set -x
+            gulp --build --env << parameters.APP_ENV >> --embedded << parameters.EMBEDDED_MODE >>
+      - persist_to_workspace:
+          root: ~/project/mob-dealerware-web
+          paths: www-*
+
+  deploy-angular:
+    working_directory: ~/project
+    parameters:
+      aws_account:
+        type: string
+        default: "SILVERCAR"
+      APP_ENV:
+        type: string
+        default: << pipeline.parameters.angular_app_env >>
+      EMBEDDED_MODE:
+        type: boolean
+        default: true
+    docker:
+      # This project cannot be updated beyond node:10 without significant refactoring
+      - image: circleci/node:10-buster
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+        user: root
+    steps:
+      - checkout
+      - init_ssh
+      - attach_workspace:
+          at: /tmp/workspace
+      - when:
+          condition:
+            equal: ["feature", << parameters.APP_ENV >>]
+          steps:
+            - run:
+                name: Set Feature Branch Environment Variables
+                command: |
+                  # Setup default branch
+                  echo "export ANGULAR_BRANCH_NAME=${CIRCLE_BRANCH}" >> $BASH_ENV
+                  # Exports 'ANGULAR_BRANCH_NAME' from '.env.feature' into the environment
+                  grep -v '^#' environment/.env.feature | awk '{print "export " $0}' >> $BASH_ENV
+      - when:
+          # This handles setting ANGULAR_BRANCH_NAME for TST and STG deployments
+          condition:
+            and:
+              - not:
+                  equal: ["feature", << parameters.APP_ENV >>]
+              - equal: ["", << pipeline.parameters.angular_github_tag >>]
+          steps:
+            - run:
+                name: Set Angular Branch name
+                command: |
+                  # TST and STG deployments point to mob-dealerware-web's 'master' branch
+                  echo "export ANGULAR_BRANCH_NAME=master" >> $BASH_ENV
+      - clone_angular:
+          GIT_BRANCH: ${ANGULAR_BRANCH_NAME}
+          GIT_TAG: << pipeline.parameters.angular_github_tag >>
+      - install_manage_buckets
+      - run:
+          # We export per-account AWS Access Keys in this step to manage deployments to different accounts
+          # TST and STG deploy to the 'silvercar' AWS account.  PRD deploys to the 'dw-prd' AWS account
+          name: Exporting AWS ENV variables
+          command: |
+            echo "export AWS_ACCESS_KEY_ID=$(echo $<< parameters.aws_account >>_AWS_ACCESS_KEY_ID)" >> $BASH_ENV
+            echo "export AWS_SECRET_ACCESS_KEY=$(echo $<< parameters.aws_account >>_AWS_SECRET_ACCESS_KEY)" >> $BASH_ENV
+      - run:
+          name: Deploy
+          no_output_timeout: 60m
+          working_directory: ~/project/mob-dealerware-web
+          command: |
+            .circleci/deploy.sh << parameters.APP_ENV >> ${ANGULAR_BRANCH_NAME}
+      - when:
+          condition:
+            equal: ["production", << parameters.APP_ENV >>]
+          steps:
+            - notify:
+                APP_NAME: "MOB Dealerware Web"
+                VERSION: ${CIRCLE_TAG}
+
+  angular_cleanup:
+    docker:
+      - image: python:3
+        auth:
+          username: ${DOCKERHUB_USERNAME}
+          password: ${DOCKERHUB_PASSWORD}
+    steps:
+      - checkout
+      - clone_angular
+      - feature_cleanup:
+          PREFIX: "dw-legacy-web-"
+          WORKING_DIRECTORY: "~/project/mob-dealerware-web"
+      - node/install:
+          node-version: "18.12"
+      - run:
+          name: Cleanup old mob-dealerware-web branches
+          working_directory: ~/project/.circleci/angular_cleanup
+          command: |
+            npm i
+            node index.js
+
+workflows:
+  version: 2
+  dw-web:
+    when: << pipeline.parameters.enable_dw_web_workflow >>
+    jobs:
+      - lint:
+          filters:
+            branches:
+              ignore:
+                - master
+      - test:
+          filters:
+            branches:
+              ignore:
+                - master
+      - build:
+          name: build-feature
+          APP_ENV: feature
+          context:
+            - docker-hub
+          filters:
+            branches:
+              ignore:
+                - master
+      - danger:
+          context:
+            - docker-hub
+            - circleci-api-token
+      - approve-storybook:
+          type: approval
+          filters:
+            branches:
+              ignore:
+                - master
+      - build-storybook:
+          context:
+            - docker-hub
+          requires:
+            - approve-storybook
+      - publish-storybook:
+          context:
+            - docker-hub
+            - dw-web-ci
+          requires:
+            - build-storybook
+      - approve-feature:
+          type: approval
+          requires:
+            - build-feature
+      - publish:
+          name: publish-feature
+          APP_ENV: feature
+          context:
+            - docker-hub
+            - dw-web-ci
+          requires:
+            - approve-feature
+      - build:
+          name: build-sandbox
+          APP_ENV: sandbox
+          context:
+            - docker-hub
+          filters:
+            branches:
+              only: master
+      - approve-sandbox:
+          type: approval
+          requires:
+            - build-sandbox
+      - publish:
+          name: publish-sandbox
+          APP_ENV: sandbox
+          context:
+            - docker-hub
+            - dw-web-ci
+          requires:
+            - approve-sandbox
+      - build:
+          name: build-tst
+          APP_ENV: qa
+          context:
+            - docker-hub
+          filters:
+            tags:
+              ignore: /.*/
+            branches:
+              only: master
+      - publish:
+          name: publish-tst
+          APP_ENV: qa
+          context:
+            - docker-hub
+            - dw-web-ci
+          requires:
+            - build-tst
+      - build:
+          name: build-stg
+          APP_ENV: stg
+          context:
+            - docker-hub
+          filters:
+            tags:
+              ignore: /.*/
+            branches:
+              only: master
+          requires:
+            - publish-tst
+      - approve-stg:
+          type: approval
+          requires:
+            - build-stg
+      - publish:
+          name: publish-stg
+          APP_ENV: stg
+          context:
+            - docker-hub
+            - dw-web-ci
+          requires:
+            - approve-stg
+      - build:
+          name: build-prd
+          APP_ENV: prd
+          context:
+            - docker-hub
+          filters:
+            tags:
+              only: /v.*/
+            branches:
+              ignore: /.*/
+      - approve-prd:
+          filters:
+            tags:
+              only: /v.*/
+          type: approval
+          requires:
+            - build-prd
+      - release-notification:
+          context:
+            - docker-hub
+          filters:
+            tags:
+              only: /v.*/
+          requires:
+            - build-prd
+      - publish:
+          name: publish-prd
+          APP_ENV: prd
+          aws_account: DW_PRD
+          context:
+            - deploy-prd
+            - docker-hub
+            - dw-web-ci
+            - slack-app-deployer-token
+            - slack-app-deployer-webhook
+          filters:
+            tags:
+              only: /v.*/
+          requires:
+            - approve-prd
+      - upload-sourcemaps:
+          context:
+            - docker-hub
+          filters:
+            tags:
+              only: /v.*/
+          requires:
+            - publish-prd
+      - post-release-synthetic-tests:
+          context:
+            - slack-app-deployer-token
+            - slack-app-deployer-webhook
+          filters:
+            tags:
+              only: /v.*/
+          requires:
+            - publish-prd
+      - dw_web_cleanup:
+          context:
+            - docker-hub
+            - dw-web-ci
+          filters:
+            branches:
+              ignore:
+                - master
+  storybook:
+    when: << pipeline.parameters.enable_dw_web_workflow >>
+    jobs:
+      - build-storybook:
+          context:
+            - docker-hub
+          filters:
+            branches:
+              only: master
+      - publish-storybook:
+          APP_ENV: prd
+          context:
+            - docker-hub
+            - dw-web-ci
+          requires:
+            - build-storybook
+  mob-dealerware-web:
+    when: << pipeline.parameters.enable_mob_dealerware_web_workflow >>
+    jobs:
+      - build-angular:
+          context:
+            - docker-hub
+            - dw-web-ci
+            - circleci-github-token
+      - deploy-angular:
+          aws_account: << pipeline.parameters.angular_aws_account >>
+          context:
+            - docker-hub
+            - dw-web-ci
+            - slack-app-deployer-token
+            - slack-app-deployer-webhook
+            - circleci-github-token
+          requires:
+            - build-angular
+      - angular_cleanup:
+          context:
+            - docker-hub
+            - dw-web-ci
+            - circleci-github-token
+          filters:
+            branches:
+              ignore:
+                - master
