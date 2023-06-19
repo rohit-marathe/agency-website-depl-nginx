@@ -1,6 +1,6 @@
-FROM nginx:latest  
+FROM nginx:latest
 
-WORKDIR "/vat/www/html"
+WORKDIR "/usr/share/nginx/html"
 
 COPY . .
 
